@@ -9,10 +9,19 @@ const {
 } = require("../controllers/authController");
 
 const { protectUser } = require("../middleware/auth");
+const {
+  validateRequest,
+  validateRequestWithAuth,
+} = require("../middleware/validateRequest");
 
-router.post("/register", registerUser);
-router.post("/login", loginUser);
-router.get("/me", protectUser, getMe);
-router.post("/logout", protectUser, logoutUser);
+const {
+  registerUserRules,
+  loginUserRules,
+} = require("../validators/authValidators");
+
+router.post("/register", ...validateRequest(registerUserRules), registerUser);
+router.post("/login", ...validateRequest(loginUserRules), loginUser);
+router.get("/me", ...validateRequestWithAuth(protectUser), getMe);
+router.post("/logout", ...validateRequestWithAuth(protectUser), logoutUser);
 
 module.exports = router;

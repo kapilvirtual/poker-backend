@@ -1,3 +1,4 @@
+const { logTableEvent } = require("../utils/liveEmitter");
 const GameTable = require("../models/GameTable");
 const AuditLog = require("../models/AuditLog");
 
@@ -59,6 +60,19 @@ const createTable = async (req, res) => {
         gameType: table.gameType,
       },
     });
+	
+	await logTableEvent({
+	  tableId: table._id,
+	  eventType: "TABLE_CREATED",
+	  message: `Table ${table.tableName} created`,
+	  payload: {
+		tableName: table.tableName,
+		gameType: table.gameType,
+		status: table.status,
+	  },
+	  createdByType: "admin",
+	  createdById: req.admin._id.toString(),
+	});
 
     return res.status(201).json({
       message: "Table created successfully",
@@ -164,6 +178,26 @@ const updateTableStatus = async (req, res) => {
         newStatus: status,
       },
     });
+	
+	await logTableEvent({
+	  tableId: table._id,
+	  eventType: "TABLE_CONFIG_UPDATED",
+	  message: `Table ${table.tableName} configuration updated`,
+	  payload: {
+		oldConfig,
+		newConfig: {
+		  tableName: table.tableName,
+		  gameType: table.gameType,
+		  maxPlayers: table.maxPlayers,
+		  ante: table.ante,
+		  smallBlind: table.smallBlind,
+		  bigBlind: table.bigBlind,
+		  notes: table.notes,
+		},
+	  },
+	  createdByType: "admin",
+	  createdById: req.admin._id.toString(),
+	});
 
     return res.status(200).json({
       message: "Table status updated successfully",
@@ -299,6 +333,17 @@ const removePlayerFromTable = async (req, res) => {
         removedUserId: userId,
       },
     });
+	
+	await logTableEvent({
+	  tableId: table._id,
+	  eventType: "TABLE_PLAYER_REMOVED",
+	  message: `Player removed from table ${table.tableName}`,
+	  payload: {
+		removedUserId: userId,
+	  },
+	  createdByType: "admin",
+	  createdById: req.admin._id.toString(),
+	});
 
     return res.status(200).json({
       message: "Player removed from table successfully",
