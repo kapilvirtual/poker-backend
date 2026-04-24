@@ -7,3 +7,5 @@ build/
 .vscode/
 .idea/
 .DS_Store
+postman/*
+.postman
