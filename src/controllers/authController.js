@@ -1,43 +1,50 @@
 const User = require("../models/User");
 const generateUserToken = require("../utils/generateUserToken");
 const {
+  generateUniqueReferralCode,
+  normalizeReferralCode,
+} = require("../utils/referrals");
+const { serializeUser } = require("../utils/userSerializer");
+const {
   FirebaseAdminConfigurationError,
   FirebaseTokenVerificationError,
   verifyFirebaseIdToken,
 } = require("../utils/verifyFirebaseIdToken");
 
-const serializeUser = (user) => ({
-  id: user._id,
-  name: user.name,
-  email: user.email,
-  phone: user.phone,
-  chips: user.chips,
-  walletBalance: user.walletBalance,
-  status: user.status,
-  isOnline: user.isOnline,
-  lastLoginAt: user.lastLoginAt,
-  avatar: user.avatar,
-});
-
 const sendAuthResponse = (res, statusCode, message, user) => {
   return res.status(statusCode).json({
     message,
+    name: user.name,
     token: generateUserToken(user),
     user: serializeUser(user),
   });
 };
 
+const getLockedAccountMessage = (user) => {
+  const lockUntil = user.security?.lockUntil;
+  if (!lockUntil) {
+    return "Too many failed login attempts. Please try again later.";
+  }
+
+  return `Too many failed login attempts. Try again after ${new Date(
+    lockUntil
+  ).toISOString()}.`;
+};
+
 const registerUser = async (req, res) => {
   try {
-    const { name, email, password, phone } = req.body;
+    const { name, email, password, phone, referralCode } = req.body;
 
-    if (!name || !email || !password) {
+    if (!name || !email || !password || !phone) {
       return res.status(400).json({
-        message: "Name, email and password are required",
+        message: "Name, email, password and phone are required",
       });
     }
 
+    const trimmedName = name.trim();
     const normalizedEmail = email.toLowerCase().trim();
+    const normalizedPhone = phone.trim();
+    const normalizedReferralCode = normalizeReferralCode(referralCode);
 
     const existingUser = await User.findOne({ email: normalizedEmail });
 
@@ -47,14 +54,34 @@ const registerUser = async (req, res) => {
       });
     }
 
+    let referrer = null;
+    if (normalizedReferralCode) {
+      referrer = await User.findOne({ referralCode: normalizedReferralCode });
+
+      if (!referrer) {
+        return res.status(400).json({
+          message: "Referral code is invalid",
+        });
+      }
+    }
+
     const user = await User.create({
       isOnline: true,
       lastLoginAt: new Date(),
-      name: name.trim(),
+      name: trimmedName,
       email: normalizedEmail,
       password,
-      phone: phone?.trim() || "",
+      phone: normalizedPhone,
+      referralCode: await generateUniqueReferralCode(User, trimmedName),
+      referredByCode: referrer?.referralCode || null,
+      referredByUserId: referrer?._id || null,
     });
+
+    if (referrer) {
+      referrer.referralStats.successfulReferrals += 1;
+      referrer.referralStats.lastSuccessfulReferralAt = new Date();
+      await referrer.save();
+    }
 
     return sendAuthResponse(res, 201, "Registration successful", user);
   } catch (error) {
@@ -91,14 +118,26 @@ const loginUser = async (req, res) => {
       });
     }
 
-    const isMatch = await user.matchPassword(password);
-
-    if (!isMatch) {
-      return res.status(401).json({
-        message: "Invalid email or password",
+    if (user.isLoginLocked()) {
+      return res.status(423).json({
+        message: getLockedAccountMessage(user),
       });
     }
 
+    const isMatch = await user.matchPassword(password);
+
+    if (!isMatch) {
+      const securityState = await user.registerFailedLoginAttempt();
+      return res.status(securityState.isLocked ? 423 : 401).json({
+        message: securityState.isLocked
+          ? getLockedAccountMessage(user)
+          : "Invalid email or password",
+      });
+    }
+
+    user.security.failedLoginAttempts = 0;
+    user.security.lastFailedLoginAt = null;
+    user.security.lockUntil = null;
     user.lastLoginAt = new Date();
     user.isOnline = true;
     await user.save();
@@ -161,6 +200,7 @@ const authenticateWithGoogle = async (req, res) => {
         lastLoginAt: new Date(),
         name: googleProfile.name,
         phone: "",
+        referralCode: await generateUniqueReferralCode(User, googleProfile.name),
         ...(googleProfile.googleId ? { googleId: googleProfile.googleId } : {}),
       });
 
@@ -170,6 +210,9 @@ const authenticateWithGoogle = async (req, res) => {
     const wasAlreadyLinked = Boolean(user.firebaseUid || user.googleId);
 
     user.firebaseUid = user.firebaseUid || googleProfile.firebaseUid;
+    user.security.failedLoginAttempts = 0;
+    user.security.lastFailedLoginAt = null;
+    user.security.lockUntil = null;
     user.lastLoginAt = new Date();
     user.isOnline = true;
 
@@ -183,6 +226,10 @@ const authenticateWithGoogle = async (req, res) => {
 
     if (!user.name && googleProfile.name) {
       user.name = googleProfile.name;
+    }
+
+    if (!user.referralCode) {
+      user.referralCode = await generateUniqueReferralCode(User, user.name);
     }
 
     await user.save();
@@ -217,7 +264,7 @@ const authenticateWithGoogle = async (req, res) => {
 
 const getMe = async (req, res) => {
   return res.status(200).json({
-    user: req.user,
+    user: serializeUser(req.user),
   });
 };
 

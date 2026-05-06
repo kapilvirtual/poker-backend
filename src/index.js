@@ -18,6 +18,7 @@ const adminLiveRoutes = require("./routes/adminLiveRoutes");
 
 const { setIO } = require("./sockets/socketRegistry");
 const { initAdminLiveSocket } = require("./sockets/adminLiveSocket");
+const { initPlayerGameSocket } = require("./sockets/playerGameSocket");
 
 //const adminHandHistoryRoutes = require("./routes/adminHandHistoryRoutes");
 //const adminSettingsRoutes = require("./routes/adminSettingsRoutes");
@@ -41,6 +42,7 @@ const io = new Server(server, {
 
 setIO(io);
 initAdminLiveSocket(io);
+initPlayerGameSocket(io);
 
 app.use(cors());
 app.use(express.json());

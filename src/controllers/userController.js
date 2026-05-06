@@ -1,4 +1,6 @@
 const User = require("../models/User");
+const HandHistory = require("../models/HandHistory");
+const { serializeUser } = require("../utils/userSerializer");
 
 const createTestUser = async (req, res) => {
   try {
@@ -39,7 +41,63 @@ const getAllUsers = async (req, res) => {
   }
 };
 
+const getMyProfile = async (req, res) => {
+  return res.status(200).json({
+    user: serializeUser(req.user),
+  });
+};
+
+const getMyGameHistory = async (req, res) => {
+  try {
+    const requestedLimit = Number.parseInt(req.query.limit || "20", 10);
+    const limit = Math.min(100, Math.max(1, requestedLimit || 20));
+
+    const hands = await HandHistory.find({
+      "players.userId": req.user._id,
+      status: "completed",
+    })
+      .sort({ completedAt: -1, createdAt: -1 })
+      .limit(limit)
+      .populate("tableId", "tableCode tableName gameType status");
+
+    return res.status(200).json({
+      count: hands.length,
+      hands,
+      message: "Game history fetched successfully",
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: "Error fetching game history",
+      error: error.message,
+    });
+  }
+};
+
+const getMyActiveHand = async (req, res) => {
+  try {
+    const activeHand = await HandHistory.findOne({
+      "players.userId": req.user._id,
+      status: "in_progress",
+    })
+      .sort({ updatedAt: -1 })
+      .populate("tableId", "tableCode tableName gameType status");
+
+    return res.status(200).json({
+      activeHand,
+      message: "Active hand fetched successfully",
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: "Error fetching active hand",
+      error: error.message,
+    });
+  }
+};
+
 module.exports = {
   createTestUser,
   getAllUsers,
+  getMyActiveHand,
+  getMyGameHistory,
+  getMyProfile,
 };

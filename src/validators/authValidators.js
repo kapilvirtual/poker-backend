@@ -19,14 +19,31 @@ const registerUserRules = [
   body("password")
     .notEmpty()
     .withMessage("Password is required")
-    .isLength({ min: 6, max: 50 })
-    .withMessage("Password must be between 6 and 50 characters"),
+    .isStrongPassword({
+      minLength: 8,
+      minLowercase: 1,
+      minNumbers: 1,
+      minSymbols: 0,
+      minUppercase: 1,
+    })
+    .withMessage(
+      "Password must be at least 8 characters and include uppercase, lowercase, and a number"
+    ),
 
   body("phone")
-    .optional({ checkFalsy: true })
     .trim()
+    .notEmpty()
+    .withMessage("Phone number is required")
+    .matches(/^[+\d()[\]\-\s]{7,20}$/)
+    .withMessage("Phone number format is invalid")
     .isLength({ min: 7, max: 20 })
     .withMessage("Phone number must be between 7 and 20 characters"),
+
+  body("referralCode")
+    .optional({ checkFalsy: true })
+    .trim()
+    .isLength({ min: 6, max: 16 })
+    .withMessage("Referral code must be between 6 and 16 characters"),
 ];
 
 const loginUserRules = [
