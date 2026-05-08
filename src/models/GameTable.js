@@ -2,6 +2,15 @@ const mongoose = require("mongoose");
 
 const POKER_PHASES = [
   "waiting",
+  "deal_3",
+  "decide_3",
+  "deal_5",
+  "decide_5",
+  "deal_7",
+  "decide_7",
+  "reveal",
+  "resolve",
+  "reshuffle",
   "preflop",
   "flop",
   "turn",
@@ -361,6 +370,10 @@ const gameTableSchema = new mongoose.Schema(
       default: null,
     },
     currentHandSnapshot: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+    variantStateSnapshot: {
       type: mongoose.Schema.Types.Mixed,
       default: null,
     },

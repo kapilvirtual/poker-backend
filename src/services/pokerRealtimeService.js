@@ -5,6 +5,13 @@ const HandHistory = require("../models/HandHistory");
 const User = require("../models/User");
 const { logTableEvent } = require("../utils/liveEmitter");
 const { Hand } = require("../utils/loadPokerSolver");
+const {
+  THREE_FIVE_SEVEN_TABLE,
+  build357WildDefinition,
+  is357Mode,
+  normalize357Mode,
+  rank357Hands,
+} = require("../utils/threeFiveSeven");
 
 const SMALL_BLIND = Math.max(
   1,
@@ -29,7 +36,11 @@ const VALID_GAMES = new Set([
   "7-27",
   "holdem",
 ]);
-const VALID_MODES = new Set(["high-only", "high-low", "low-only"]);
+const VALID_STANDARD_MODES = new Set(["high-only", "high-low", "low-only"]);
+const VALID_MODES = new Set([
+  ...VALID_STANDARD_MODES,
+  ...THREE_FIVE_SEVEN_TABLE.modes,
+]);
 const VALID_LOW_RULES = new Set(["8-or-better", "wheel", "any-low"]);
 const VALID_WILD_CARDS = new Set([
   "A",
@@ -83,6 +94,26 @@ function cloneGameSettings(gameSettings) {
     },
     wildCards: Array.isArray(source.wildCards) ? [...source.wildCards] : [],
   };
+}
+
+function sync357GameSettings(gameSettings) {
+  const nextSettings = cloneGameSettings(gameSettings);
+
+  if (nextSettings.game === "357") {
+    const mode = normalize357Mode(nextSettings);
+    nextSettings.mode = mode;
+    nextSettings.stips.bestFiveCards = mode === "BEST_FIVE";
+    nextSettings.stips.hostestWithTheMostest = mode === "HOSTEST";
+    nextSettings.stips.wildCards = false;
+    nextSettings.wildCards = [];
+    return nextSettings;
+  }
+
+  if (is357Mode(nextSettings.mode)) {
+    nextSettings.mode = "high-only";
+  }
+
+  return nextSettings;
 }
 
 function normalizeWildCards(wildCards) {
@@ -260,7 +291,139 @@ function addLog(room, message) {
   room.actionLog = room.actionLog.slice(0, LOG_LIMIT);
 }
 
+function createThreeFiveSevenRoomState() {
+  return {
+    activeRound: null,
+    activeWildDefinition: build357WildDefinition(
+      THREE_FIVE_SEVEN_TABLE.defaultMode,
+      null
+    ),
+    anteAmount: THREE_FIVE_SEVEN_TABLE.anteClips,
+    anteCollectionKeys: {},
+    hiddenDecisionState: {
+      currentRound: null,
+      historyByPlayerId: {},
+      revealedByPlayerId: {},
+    },
+    lastPhaseSequence: [],
+    lastResolution: null,
+    legsByPlayerId: {},
+    mode: THREE_FIVE_SEVEN_TABLE.defaultMode,
+    penaltyModel: {
+      legsToWin: THREE_FIVE_SEVEN_TABLE.legsToWin,
+      soloGoLegAward: 1,
+      unitToPot: THREE_FIVE_SEVEN_TABLE.goLossPenaltyToPotClips,
+      unitToWinner: THREE_FIVE_SEVEN_TABLE.goLossPenaltyToWinnerClips,
+    },
+    pot: 0,
+    revealState: "hidden",
+    showdownPlayerIds: [],
+  };
+}
+
+function ensureThreeFiveSevenState(room) {
+  if (!room.threeFiveSeven) {
+    room.threeFiveSeven = createThreeFiveSevenRoomState();
+  }
+
+  const mode = normalize357Mode(ensureGameSettings(room));
+  room.threeFiveSeven.anteAmount = THREE_FIVE_SEVEN_TABLE.anteClips;
+  room.threeFiveSeven.anteCollectionKeys =
+    room.threeFiveSeven.anteCollectionKeys || {};
+  room.threeFiveSeven.penaltyModel = {
+    ...(room.threeFiveSeven.penaltyModel || {}),
+    legsToWin: THREE_FIVE_SEVEN_TABLE.legsToWin,
+    soloGoLegAward: 1,
+    unitToPot: THREE_FIVE_SEVEN_TABLE.goLossPenaltyToPotClips,
+    unitToWinner: THREE_FIVE_SEVEN_TABLE.goLossPenaltyToWinnerClips,
+  };
+  room.threeFiveSeven.mode = mode;
+  room.threeFiveSeven.activeWildDefinition = room.threeFiveSeven.activeRound
+    ? build357WildDefinition(mode, room.threeFiveSeven.activeRound)
+    : build357WildDefinition(mode, null);
+
+  room.players.forEach((player) => {
+    if (typeof room.threeFiveSeven.legsByPlayerId[player.id] !== "number") {
+      room.threeFiveSeven.legsByPlayerId[player.id] = 0;
+    }
+
+    if (!room.threeFiveSeven.hiddenDecisionState.historyByPlayerId[player.id]) {
+      room.threeFiveSeven.hiddenDecisionState.historyByPlayerId[player.id] = {};
+    }
+  });
+
+  return room.threeFiveSeven;
+}
+
+function is357Game(room) {
+  return ensureGameSettings(room).game === "357";
+}
+
+function eligible357ParticipantIds(room) {
+  return roomOrderIds(
+    room,
+    (player) =>
+      player.isConnected &&
+      !player.pendingRemoval &&
+      player.chips >= THREE_FIVE_SEVEN_TABLE.anteClips
+  );
+}
+
+function set357Phase(room, phase) {
+  if (!room.hand) {
+    return;
+  }
+
+  room.hand.phase = phase;
+  room.phase = phase;
+  if (
+    room.hand.threeFiveSeven.phaseSequence[
+      room.hand.threeFiveSeven.phaseSequence.length - 1
+    ] !== phase
+  ) {
+    room.hand.threeFiveSeven.phaseSequence.push(phase);
+  }
+}
+
+function normalize357Action(actionType) {
+  const action = typeof actionType === "string" ? actionType.trim().toUpperCase() : "";
+
+  if (action === "GO" || action === "PLAYER_GO") {
+    return "GO";
+  }
+
+  if (action === "STAY" || action === "PLAYER_STAY") {
+    return "STAY";
+  }
+
+  if (action === "FOLD" || action === "PLAYER_FOLD") {
+    return "FOLD";
+  }
+
+  return null;
+}
+
+function is357DecisionPhase(room) {
+  if (!room.hand) {
+    return false;
+  }
+
+  const roundSize = Number(room.hand.phase.slice(-1));
+  return (
+    room.hand.phase.startsWith("decide_") &&
+    THREE_FIVE_SEVEN_TABLE.rounds.includes(roundSize)
+  );
+}
+
+function get357DecisionRound(room) {
+  return is357DecisionPhase(room) ? Number(room.hand.phase.slice(-1)) : null;
+}
+
 function totalPot(room) {
+  if (is357Game(room)) {
+    return ensureThreeFiveSevenState(room).pot;
+  }
+
   if (!room.hand) {
     return 0;
   }
@@ -289,6 +452,196 @@ function commitChips(room, playerId, amount) {
   handPlayer.totalContribution += committed;
   handPlayer.allIn = roomPlayer.chips === 0;
   return committed;
+}
+
+function contribute357ToPot(room, playerId, amount) {
+  const roomPlayer = getPlayer(room, playerId);
+  const handPlayer = getHandPlayer(room, playerId);
+  const variantState = ensureThreeFiveSevenState(room);
+
+  if (!roomPlayer || !handPlayer) {
+    return 0;
+  }
+
+  const committed = Math.max(0, Math.min(amount, roomPlayer.chips));
+  roomPlayer.chips -= committed;
+  handPlayer.totalContribution += committed;
+  handPlayer.allIn = roomPlayer.chips === 0;
+  variantState.pot += committed;
+  return committed;
+}
+
+function withdraw357ForWinner(room, playerId, amount) {
+  const roomPlayer = getPlayer(room, playerId);
+  const handPlayer = getHandPlayer(room, playerId);
+
+  if (!roomPlayer || !handPlayer) {
+    return 0;
+  }
+
+  const committed = Math.max(0, Math.min(amount, roomPlayer.chips));
+  roomPlayer.chips -= committed;
+  handPlayer.totalContribution += committed;
+  handPlayer.allIn = roomPlayer.chips === 0;
+  return committed;
+}
+
+function reset357PublicDecisionState(room, roundSize) {
+  const variantState = ensureThreeFiveSevenState(room);
+  variantState.activeRound = roundSize;
+  variantState.activeWildDefinition = build357WildDefinition(
+    variantState.mode,
+    roundSize
+  );
+  variantState.hiddenDecisionState.currentRound = roundSize;
+  variantState.hiddenDecisionState.revealedByPlayerId = {};
+  variantState.revealState = "hidden";
+  variantState.showdownPlayerIds = [];
+}
+
+function deal357ToRound(room, roundSize) {
+  if (!room.hand) {
+    return;
+  }
+
+  activeHandIds(room).forEach((playerId) => {
+    const handPlayer = room.hand.players[playerId];
+    while (handPlayer.cards.length < roundSize) {
+      handPlayer.cards.push(room.hand.deck.pop());
+    }
+  });
+
+  reset357PublicDecisionState(room, roundSize);
+  set357Phase(room, `decide_${roundSize}`);
+}
+
+function findNext357DecisionPlayer(room, roundSize, fromPlayerId) {
+  return nextId(
+    activeHandIds(room),
+    fromPlayerId,
+    (playerId) =>
+      room.hand.threeFiveSeven.decisionHistoryByPlayerId[playerId]?.[
+        roundSize
+      ] == null
+  );
+}
+
+function collect357AnteOnce(room, participantIds, cycleKey) {
+  const variantState = ensureThreeFiveSevenState(room);
+  if (!cycleKey || variantState.anteCollectionKeys[cycleKey]) {
+    return { chargedPlayerIds: [], collectedTotal: 0 };
+  }
+
+  const chargedPlayerIds = [];
+  let collectedTotal = 0;
+
+  participantIds.forEach((participantId) => {
+    const contributed = contribute357ToPot(
+      room,
+      participantId,
+      variantState.anteAmount
+    );
+    if (contributed > 0) {
+      chargedPlayerIds.push(participantId);
+      collectedTotal += contributed;
+    }
+  });
+
+  variantState.anteCollectionKeys[cycleKey] = {
+    chargedPlayerIds,
+    collectedTotal,
+    handNumber: room.handCount,
+  };
+
+  return { chargedPlayerIds, collectedTotal };
+}
+
+function start357Cycle(room) {
+  const variantState = ensureThreeFiveSevenState(room);
+
+  const participants = eligible357ParticipantIds(room);
+  if (participants.length < 2) {
+    if (room.hand) {
+      room.hand.currentPlayerId = null;
+      room.hand.phase = "completed";
+      room.lastDealerId = room.hand.dealerId;
+      room.phase = "completed";
+      room.status = "paused";
+    }
+    return false;
+  }
+
+  const dealerId = nextId(participants, room.lastDealerId);
+  const deck = createDeck();
+  room.currentHandDbId = null;
+
+  room.hand = {
+    bigBlindId: null,
+    communityCards: [],
+    currentBet: 0,
+    currentPlayerId: null,
+    dealerId,
+    deck,
+    minRaise: 0,
+    phase: "deal_3",
+    players: {},
+    showdownDescriptions: {},
+    smallBlindId: null,
+    startedAt: Date.now(),
+    threeFiveSeven: {
+      decisionHistoryByPlayerId: {},
+      finalDecisionByPlayerId: {},
+      phaseSequence: [],
+      visibleDecisionsByPlayerId: {},
+    },
+  };
+  room.handCount += 1;
+  room.lastWinnerSummary = null;
+  room.phase = "deal_3";
+  room.status = "active";
+
+  participants.forEach((participantId) => {
+    room.hand.players[participantId] = {
+      allIn: false,
+      betThisRound: 0,
+      cards: [],
+      folded: false,
+      handDescription: null,
+      hasActed: false,
+      payout: 0,
+      startingStack: getPlayer(room, participantId).chips,
+      totalContribution: 0,
+    };
+    room.hand.threeFiveSeven.decisionHistoryByPlayerId[participantId] = {
+      3: null,
+      5: null,
+      7: null,
+    };
+    room.hand.threeFiveSeven.finalDecisionByPlayerId[participantId] = null;
+    room.hand.threeFiveSeven.visibleDecisionsByPlayerId[participantId] = null;
+    variantState.hiddenDecisionState.historyByPlayerId[participantId] = {
+      3: null,
+      5: null,
+      7: null,
+    };
+  });
+
+  const anteCollection = collect357AnteOnce(
+    room,
+    participants,
+    `hand:${room.handCount}:deal:1`
+  );
+
+  set357Phase(room, "deal_3");
+  addLog(
+    room,
+    `357 cycle #${room.handCount} started. Dealer button is on ${getPlayer(room, dealerId).name}.`
+  );
+  addLog(
+    room,
+    `${anteCollection.chargedPlayerIds.length} players anted ${variantState.anteAmount}.`
+  );
+  return true;
 }
 
 function resetActionFlags(room, actorId) {
@@ -401,6 +754,241 @@ function completeHand(room) {
   room.status = room.players.length >= MIN_PLAYERS_TO_START ? "waiting" : "paused";
 }
 
+function reveal357Decisions(room) {
+  const variantState = ensureThreeFiveSevenState(room);
+  const roundSize = variantState.activeRound || 7;
+  const revealedByPlayerId = {};
+
+  activeHandIds(room).forEach((playerId) => {
+    const decision =
+      room.hand.threeFiveSeven.decisionHistoryByPlayerId[playerId]?.[roundSize] ||
+      room.hand.threeFiveSeven.finalDecisionByPlayerId[playerId] ||
+      "STAY";
+    revealedByPlayerId[playerId] = decision;
+    room.hand.threeFiveSeven.visibleDecisionsByPlayerId[playerId] = decision;
+  });
+
+  variantState.hiddenDecisionState.revealedByPlayerId = revealedByPlayerId;
+  variantState.showdownPlayerIds = Object.keys(revealedByPlayerId).filter(
+    (playerId) => revealedByPlayerId[playerId] === "GO"
+  );
+  variantState.revealState = "revealed";
+  addLog(
+    room,
+    `Reveal: ${roomOrderIds(room, (player) => Boolean(revealedByPlayerId[player.id]))
+      .map((playerId) => `${getPlayer(room, playerId).name} ${revealedByPlayerId[playerId]}`)
+      .join(", ")}.`
+  );
+}
+
+function resolve357Cycle(room) {
+  if (!room.hand) {
+    return;
+  }
+
+  const variantState = ensureThreeFiveSevenState(room);
+  const goPlayerIds = variantState.showdownPlayerIds.filter((playerId) =>
+    Boolean(room.hand.players[playerId])
+  );
+  const payouts = {};
+  const legDeltaByPlayerId = {};
+  const legsByPlayerId = variantState.legsByPlayerId;
+  const potBefore = variantState.pot;
+  let potAwarded = 0;
+  let potPenaltyTotal = 0;
+  let winnerPenaltyTotal = 0;
+  let winnerIds = [];
+  let loserIds = [];
+  let showdownDescriptions = {};
+
+  activeHandIds(room).forEach((playerId) => {
+    payouts[playerId] = 0;
+    legDeltaByPlayerId[playerId] = 0;
+  });
+
+  if (goPlayerIds.length === 0) {
+    room.lastWinnerSummary = "No GO players. Pot carries to the next reshuffle.";
+  } else if (goPlayerIds.length === 1) {
+    const winnerId = goPlayerIds[0];
+    winnerIds = [winnerId];
+    potAwarded = variantState.pot;
+    payouts[winnerId] = potAwarded;
+    getPlayer(room, winnerId).chips += potAwarded;
+    room.hand.players[winnerId].payout = potAwarded;
+    variantState.pot = 0;
+    legsByPlayerId[winnerId] = (legsByPlayerId[winnerId] || 0) + 1;
+    legDeltaByPlayerId[winnerId] = 1;
+    room.lastWinnerSummary = `${getPlayer(room, winnerId).name} wins ${potAwarded} chips as the only GO and earns 1 leg.`;
+  } else {
+    const playerCardsById = {};
+    goPlayerIds.forEach((playerId) => {
+      playerCardsById[playerId] = [...room.hand.players[playerId].cards];
+    });
+
+    const { rankedHands, winnerIds: rankedWinnerIds } = rank357Hands(
+      playerCardsById,
+      variantState.mode,
+      variantState.activeWildDefinition.wildRanks
+    );
+    winnerIds = rankedWinnerIds;
+    rankedHands.forEach((entry) => {
+      showdownDescriptions[entry.playerId] = entry.solved.descr;
+      room.hand.players[entry.playerId].handDescription = entry.solved.descr;
+    });
+    loserIds = goPlayerIds.filter((playerId) => !winnerIds.includes(playerId));
+
+    loserIds.forEach((playerId) => {
+      winnerPenaltyTotal += withdraw357ForWinner(
+        room,
+        playerId,
+        variantState.penaltyModel.unitToWinner
+      );
+      potPenaltyTotal += contribute357ToPot(
+        room,
+        playerId,
+        variantState.penaltyModel.unitToPot
+      );
+      legsByPlayerId[playerId] = 0;
+    });
+
+    const orderedWinnerIds = roomOrderIds(room, (player) =>
+      winnerIds.includes(player.id)
+    );
+    const splitAmount =
+      orderedWinnerIds.length > 0
+        ? Math.floor(winnerPenaltyTotal / orderedWinnerIds.length)
+        : 0;
+    let remainder =
+      orderedWinnerIds.length > 0
+        ? winnerPenaltyTotal % orderedWinnerIds.length
+        : 0;
+
+    orderedWinnerIds.forEach((playerId) => {
+      const amount = splitAmount + (remainder > 0 ? 1 : 0);
+      payouts[playerId] += amount;
+      getPlayer(room, playerId).chips += amount;
+      room.hand.players[playerId].payout = amount;
+      if (remainder > 0) {
+        remainder -= 1;
+      }
+    });
+
+    room.hand.showdownDescriptions = showdownDescriptions;
+    room.lastWinnerSummary =
+      winnerIds.length > 1
+        ? `${winnerIds.map((playerId) => getPlayer(room, playerId).name).join(" & ")} split ${winnerPenaltyTotal} chips.`
+        : `${getPlayer(room, winnerIds[0]).name} wins ${winnerPenaltyTotal} chips (${showdownDescriptions[winnerIds[0]]}).`;
+  }
+
+  addLog(room, room.lastWinnerSummary);
+  variantState.revealState = "resolved";
+  variantState.lastPhaseSequence = [...room.hand.threeFiveSeven.phaseSequence];
+  variantState.lastResolution = {
+    goPlayerIds,
+    handNumber: room.handCount,
+    legDeltaByPlayerId,
+    loserIds,
+    outcome:
+      goPlayerIds.length === 0
+        ? "no_go"
+        : goPlayerIds.length === 1
+          ? "solo_go"
+          : winnerIds.length > 1
+            ? "showdown_tie"
+            : "showdown",
+    payoutByPlayerId: payouts,
+    potAfterResolution: variantState.pot,
+    potAwarded,
+    potBeforeResolution: potBefore,
+    potPenaltyTotal,
+    revealedDecisions: { ...variantState.hiddenDecisionState.revealedByPlayerId },
+    showdownDescriptions,
+    splitWinnerPayout: winnerIds.length > 1,
+    winnerIds,
+    winnerPenaltyTotal,
+  };
+}
+
+function advance357Game(room) {
+  if (!room.hand) {
+    return;
+  }
+
+  while (room.hand && room.hand.phase !== "completed") {
+    if (room.hand.phase === "deal_3") {
+      deal357ToRound(room, 3);
+      continue;
+    }
+
+    if (room.hand.phase === "deal_5") {
+      deal357ToRound(room, 5);
+      continue;
+    }
+
+    if (room.hand.phase === "deal_7") {
+      deal357ToRound(room, 7);
+      continue;
+    }
+
+    if (
+      room.hand.phase === "decide_3" ||
+      room.hand.phase === "decide_5" ||
+      room.hand.phase === "decide_7"
+    ) {
+      const roundSize = Number(room.hand.phase.slice(-1));
+      const nextPlayerId = findNext357DecisionPlayer(
+        room,
+        roundSize,
+        room.hand.currentPlayerId
+      );
+
+      if (nextPlayerId) {
+        room.hand.currentPlayerId = nextPlayerId;
+        return;
+      }
+
+      room.hand.currentPlayerId = null;
+      if (roundSize === 3) {
+        set357Phase(room, "deal_5");
+        continue;
+      }
+
+      if (roundSize === 5) {
+        set357Phase(room, "deal_7");
+        continue;
+      }
+
+      set357Phase(room, "reveal");
+      continue;
+    }
+
+    if (room.hand.phase === "reveal") {
+      reveal357Decisions(room);
+      set357Phase(room, "resolve");
+      continue;
+    }
+
+    if (room.hand.phase === "resolve") {
+      resolve357Cycle(room);
+      room.lastDealerId = room.hand.dealerId;
+      set357Phase(room, "reshuffle");
+      ensureThreeFiveSevenState(room).lastPhaseSequence = [
+        ...room.hand.threeFiveSeven.phaseSequence,
+      ];
+      continue;
+    }
+
+    if (room.hand.phase === "reshuffle") {
+      if (!start357Cycle(room)) {
+        return;
+      }
+      continue;
+    }
+
+    return;
+  }
+}
+
 function awardSingleWinner(room, winnerId) {
   const winner = getPlayer(room, winnerId);
   if (!room.hand || !winner) {
@@ -483,6 +1071,11 @@ function advanceGame(room) {
     return;
   }
 
+  if (is357Game(room)) {
+    advance357Game(room);
+    return;
+  }
+
   while (room.hand && room.hand.phase !== "completed") {
     const contenders = contenderIds(room);
 
@@ -516,7 +1109,7 @@ function buildPlayerStatusPayload(player) {
 }
 
 function ensureGameSettings(room) {
-  room.gameSettings = cloneGameSettings(room.gameSettings);
+  room.gameSettings = sync357GameSettings(room.gameSettings);
   room.gameSettings.locked = Boolean(
     room.gameSettings.locked || room.handCount > 0
   );
@@ -569,7 +1162,8 @@ function applyGameSettingsUpdate(room, update) {
   }
 
   nextSettings.locked = Boolean(nextSettings.locked || room.handCount > 0);
-  room.gameSettings = nextSettings;
+  room.gameSettings = sync357GameSettings(nextSettings);
+  room.gameSettings.locked = nextSettings.locked;
   return room.gameSettings;
 }
 
@@ -725,7 +1319,12 @@ class PokerRealtimeService {
       tableDbId: null,
       tableInvites: [],
       tableName: sanitizeTableName(payload.tableName, tableCode),
+      threeFiveSeven: null,
     };
+    applyGameSettingsUpdate(room, payload.gameSettings || payload.update || {});
+    if (room.gameSettings.game === "357") {
+      ensureThreeFiveSevenState(room);
+    }
 
     const table = await GameTable.create({
       actionLog: room.actionLog,
@@ -842,7 +1441,12 @@ class PokerRealtimeService {
       tableDbId: table._id.toString(),
       tableInvites: cloneValue(table.tableInvites || []),
       tableName: table.tableName,
+      threeFiveSeven: cloneValue(table.variantStateSnapshot || null),
     };
+
+    if (room.gameSettings.game === "357") {
+      ensureThreeFiveSevenState(room);
+    }
 
     this.rooms.set(room.id, room);
     return room;
@@ -900,6 +1504,9 @@ class PokerRealtimeService {
 
     const player = buildPlayerFromUser(user, seatNumber, socket.id, room.buyInAmount);
     room.players.push(player);
+    if (is357Game(room)) {
+      ensureThreeFiveSevenState(room);
+    }
     addLog(room, `${player.name} joined the table.`);
     room.status = "waiting";
     room.phase = room.hand?.phase || "waiting";
@@ -987,6 +1594,50 @@ class PokerRealtimeService {
 
     if (room.hand && room.hand.phase !== "completed") {
       throw new Error("A hand is already in progress.");
+    }
+
+    if (room.gameSettings.game === "357") {
+      const participants = eligible357ParticipantIds(room);
+      if (participants.length < room.minPlayersToStart) {
+        throw new Error(
+          `At least two connected players with ${THREE_FIVE_SEVEN_TABLE.anteClips} chip(s) are required.`
+        );
+      }
+
+      room.gameSettings.locked = true;
+      ensureThreeFiveSevenState(room);
+      if (!start357Cycle(room)) {
+        throw new Error("Unable to start a 357 cycle.");
+      }
+      advanceGame(room);
+      await this.persistRoom(room);
+      await logTableEvent({
+        createdById: session.playerId,
+        createdByType: "player",
+        eventType: "HAND_STARTED",
+        message: `357 cycle ${room.handCount} started on table ${room.id}`,
+        payload: {
+          game: "357",
+          handNumber: room.handCount,
+          roomId: room.id,
+        },
+        tableId: room.tableDbId,
+      });
+      await logTableEvent({
+        createdById: "system",
+        createdByType: "system",
+        eventType: "CARDS_DEALT",
+        message: `357 round ${room.threeFiveSeven?.activeRound || 3} cards dealt on table ${room.id}`,
+        payload: {
+          activeRound: room.threeFiveSeven?.activeRound || 3,
+          game: "357",
+          handNumber: room.handCount,
+          roomId: room.id,
+        },
+        tableId: room.tableDbId,
+      });
+      await this.emitRoomState(room);
+      return;
     }
 
     const participants = roomOrderIds(
@@ -1079,6 +1730,113 @@ class PokerRealtimeService {
 
     if (!room.hand || room.hand.phase === "completed") {
       throw new Error("No active hand to act in.");
+    }
+
+    if (is357Game(room)) {
+      const roundSize = get357DecisionRound(room);
+      if (!roundSize) {
+        throw new Error("357 is not waiting on a decision.");
+      }
+
+      if (!room.hand.players[session.playerId]) {
+        throw new Error("Player is not active in this 357 cycle.");
+      }
+
+      const decision = normalize357Action(actionType);
+      if (!decision) {
+        throw new Error("Only GO, STAY, and FOLD intents are available in 357.");
+      }
+
+      const lockedDecision =
+        room.hand.threeFiveSeven.decisionHistoryByPlayerId[session.playerId]?.[
+          roundSize
+        ] || null;
+      const nextDecision = decision === "FOLD" ? "STAY" : decision;
+
+      if (lockedDecision != null) {
+        if (lockedDecision === nextDecision) {
+          advanceGame(room);
+          await this.persistRoom(room);
+          await this.emitRoomState(room);
+          return;
+        }
+
+        throw new Error("357 action is already locked for this round.");
+      }
+
+      room.hand.threeFiveSeven.decisionHistoryByPlayerId[session.playerId][
+        roundSize
+      ] = nextDecision;
+      room.hand.threeFiveSeven.finalDecisionByPlayerId[session.playerId] =
+        nextDecision;
+      ensureThreeFiveSevenState(room).hiddenDecisionState.historyByPlayerId[
+        session.playerId
+      ][roundSize] = nextDecision;
+      room.hand.currentPlayerId = findNext357DecisionPlayer(
+        room,
+        roundSize,
+        session.playerId
+      );
+
+      const player = getPlayer(room, session.playerId);
+      const message = `${player.name} locked a 357 decision for round ${roundSize}.`;
+      const previousResolutionKey = room.threeFiveSeven?.lastResolution
+        ? `${room.threeFiveSeven.lastResolution.handNumber}:${room.threeFiveSeven.lastResolution.outcome}`
+        : null;
+      addLog(room, message);
+      advanceGame(room);
+      const nextResolution = room.threeFiveSeven?.lastResolution || null;
+      const nextResolutionKey = nextResolution
+        ? `${nextResolution.handNumber}:${nextResolution.outcome}`
+        : null;
+
+      await this.persistRoom(room);
+      await logTableEvent({
+        createdById: session.playerId,
+        createdByType: "player",
+        eventType: "PLAYER_ACTION",
+        message,
+        payload: {
+          actionType: nextDecision,
+          game: "357",
+          roomId: room.id,
+          roundSize,
+        },
+        tableId: room.tableDbId,
+      });
+      if (nextResolution && nextResolutionKey !== previousResolutionKey) {
+        await logTableEvent({
+          createdById: session.playerId,
+          createdByType: "player",
+          eventType: "WINNER_DECLARED",
+          message: room.lastWinnerSummary || "357 round resolved.",
+          payload: {
+            game: "357",
+            result: nextResolution,
+            roomId: room.id,
+          },
+          tableId: room.tableDbId,
+        });
+
+        if (room.handCount > nextResolution.handNumber) {
+          await logTableEvent({
+            createdById: "system",
+            createdByType: "system",
+            eventType: "ROUND_RESET",
+            message: `357 table ${room.id} moved to cycle ${room.handCount}.`,
+            payload: {
+              game: "357",
+              handNumber: room.handCount,
+              previousHandNumber: nextResolution.handNumber,
+              roomId: room.id,
+            },
+            tableId: room.tableDbId,
+          });
+        }
+      }
+      await this.emitRoomState(room);
+      await this.cleanupRoomIfEmpty(room);
+      return;
     }
 
     if (room.hand.currentPlayerId !== session.playerId) {
@@ -1273,11 +2031,37 @@ class PokerRealtimeService {
     player.socketId = null;
 
     if (room.hand && room.hand.phase !== "completed" && room.hand.players[player.id]) {
-      const handPlayer = room.hand.players[player.id];
-      if (!handPlayer.folded && !handPlayer.allIn) {
-        handPlayer.folded = true;
-        handPlayer.hasActed = true;
-        addLog(room, `${player.name} left the table and folded.`);
+      if (is357Game(room)) {
+        const roundSize = Number(room.hand.phase.slice(-1));
+        if (
+          Number.isInteger(roundSize) &&
+          THREE_FIVE_SEVEN_TABLE.rounds.includes(roundSize)
+        ) {
+          const lockedDecision =
+            room.hand.threeFiveSeven.decisionHistoryByPlayerId[player.id]?.[
+              roundSize
+            ] || null;
+          if (lockedDecision == null) {
+            room.hand.threeFiveSeven.decisionHistoryByPlayerId[player.id][
+              roundSize
+            ] = "STAY";
+            room.hand.threeFiveSeven.finalDecisionByPlayerId[player.id] = "STAY";
+            ensureThreeFiveSevenState(room).hiddenDecisionState.historyByPlayerId[
+              player.id
+            ][roundSize] = "STAY";
+          }
+        }
+        addLog(
+          room,
+          `${player.name} left the table and unresolved 357 decisions are treated as STAY.`
+        );
+      } else {
+        const handPlayer = room.hand.players[player.id];
+        if (!handPlayer.folded && !handPlayer.allIn) {
+          handPlayer.folded = true;
+          handPlayer.hasActed = true;
+          addLog(room, `${player.name} left the table and folded.`);
+        }
       }
       advanceGame(room);
     }
@@ -1488,6 +2272,8 @@ class PokerRealtimeService {
   buildControls(room, playerId) {
     const player = getPlayer(room, playerId);
     const handPlayer = getHandPlayer(room, playerId);
+    const gameSettings = ensureGameSettings(room);
+    const is357 = gameSettings.game === "357";
 
     if (!player) {
       return {
@@ -1504,21 +2290,53 @@ class PokerRealtimeService {
     const canStartHand =
       room.hostId === playerId &&
       (!room.hand || room.hand.phase === "completed") &&
-      roomOrderIds(
-        room,
-        (entry) => entry.isConnected && !entry.pendingRemoval && entry.chips > 0
-      ).length >= room.minPlayersToStart;
+      (is357
+        ? eligible357ParticipantIds(room).length >= room.minPlayersToStart
+        : roomOrderIds(
+            room,
+            (entry) => entry.isConnected && !entry.pendingRemoval && entry.chips > 0
+          ).length >= room.minPlayersToStart);
     const canRebuy =
-      player.chips <= 0 && (!room.hand || room.hand.phase === "completed");
+      player.chips <= 0 && (is357 || !room.hand || room.hand.phase === "completed");
 
     if (
       !room.hand ||
       room.hand.phase === "completed" ||
       !handPlayer ||
-      room.hand.currentPlayerId !== playerId ||
       handPlayer.folded ||
       handPlayer.allIn
     ) {
+      return {
+        availableActions: [],
+        callAmount: 0,
+        canAct: false,
+        canRebuy,
+        canStartHand,
+        maxRaiseTo: 0,
+        minRaiseTo: 0,
+      };
+    }
+
+    if (is357) {
+      const roundSize = get357DecisionRound(room);
+      const decisionLocked = roundSize
+        ? room.hand.threeFiveSeven.decisionHistoryByPlayerId[playerId]?.[
+            roundSize
+          ] != null
+        : true;
+
+      return {
+        availableActions: !decisionLocked ? ["go", "stay", "fold"] : [],
+        callAmount: 0,
+        canAct: !decisionLocked,
+        canRebuy,
+        canStartHand,
+        maxRaiseTo: 0,
+        minRaiseTo: 0,
+      };
+    }
+
+    if (room.hand.currentPlayerId !== playerId) {
       return {
         availableActions: [],
         callAmount: 0,
@@ -1563,14 +2381,23 @@ class PokerRealtimeService {
   buildRoomState(room, playerId) {
     const hand = room.hand;
     const controls = this.buildControls(room, playerId);
+    const gameSettings = ensureGameSettings(room);
+    const is357 = gameSettings.game === "357";
+    const variantState = is357 ? ensureThreeFiveSevenState(room) : null;
     const sortedPlayers = buildPlayerRuntimeMap(room.players);
     const players = sortedPlayers.map((player) => {
       const handPlayer = hand?.players?.[player.id];
+      const revealedDecision = is357
+        ? variantState.hiddenDecisionState.revealedByPlayerId[player.id] || null
+        : null;
       const revealCards = Boolean(
         handPlayer &&
-          (player.id === playerId ||
-            ((hand?.phase === "completed" || hand?.phase === "showdown") &&
-              !handPlayer.folded))
+          (is357
+            ? player.id === playerId ||
+              (variantState.revealState !== "hidden" && revealedDecision === "GO")
+            : player.id === playerId ||
+              ((hand?.phase === "completed" || hand?.phase === "showdown") &&
+                !handPlayer.folded))
       );
       const statusPayload = buildPlayerStatusPayload(player);
 
@@ -1581,7 +2408,7 @@ class PokerRealtimeService {
           hand?.showdownDescriptions?.[player.id] ||
           handPlayer?.handDescription ||
           null,
-        hasFolded: handPlayer?.folded ?? false,
+        hasFolded: is357 ? false : handPlayer?.folded ?? false,
         holeCards: revealCards ? handPlayer.cards : [],
         id: player.id,
         isAllIn: handPlayer?.allIn ?? false,
@@ -1589,11 +2416,18 @@ class PokerRealtimeService {
         isConnected: player.isConnected,
         isDealer: hand?.dealerId === player.id,
         isHost: room.hostId === player.id,
+        legs: variantState?.legsByPlayerId[player.id] ?? 0,
         isSmallBlind: hand?.smallBlindId === player.id,
         isTurn: hand?.currentPlayerId === player.id,
         name: player.name,
+        netChipBalance: 0,
         playerStatus: statusPayload.playerStatus,
+        revealedDecision,
         statusSnapshot: statusPayload.statusSnapshot,
+        statusMomentum: 0,
+        statusScore: 0,
+        statusTier: player.playerStatus || "none",
+        statusUpdatedAt: null,
         totalContribution: handPlayer?.totalContribution ?? 0,
       };
     });
@@ -1602,8 +2436,19 @@ class PokerRealtimeService {
     const actingPlayer = hand?.currentPlayerId
       ? getPlayer(room, hand.currentPlayerId)
       : null;
-    const statusMessage =
-      phase === "completed"
+    const statusMessage = is357
+      ? phase === "completed"
+        ? room.lastWinnerSummary || "357 is waiting for the next cycle."
+        : phase === "resolve" || phase === "reshuffle"
+          ? room.lastWinnerSummary || "Resolving 357."
+          : phase === "reveal"
+            ? "Revealing GO and STAY."
+            : phase.startsWith("decide_")
+              ? hand?.currentPlayerId === playerId
+                ? `Round ${variantState.activeRound}: choose GO or STAY.`
+                : `Round ${variantState.activeRound}: waiting for players...`
+              : "Dealing 357 cards."
+      : phase === "completed"
         ? room.lastWinnerSummary || "Hand complete."
         : actingPlayer
           ? `${actingPlayer.name} to act.`
@@ -1611,14 +2456,14 @@ class PokerRealtimeService {
 
     return {
       actionLog: room.actionLog,
-      bigBlind: room.bigBlind,
+      bigBlind: is357 ? 0 : room.bigBlind,
       chatMessages: room.chatMessages || [],
       communityCards: hand?.communityCards || [],
       controls,
       currentBet: hand?.currentBet || 0,
       currentTurnPlayerId: hand?.currentPlayerId || null,
       economy: null,
-      gameSettings: cloneGameSettings(ensureGameSettings(room)),
+      gameSettings: cloneGameSettings(gameSettings),
       handNumber: room.handCount,
       hostId: room.hostId,
       inviteRecipients: [],
@@ -1628,9 +2473,51 @@ class PokerRealtimeService {
       pot: totalPot(room),
       roomId: room.id,
       selfId: playerId,
-      smallBlind: room.smallBlind,
+      smallBlind: is357 ? 0 : room.smallBlind,
       statusMessage,
       tableInvites: room.tableInvites || [],
+      threeFiveSeven: is357
+        ? {
+            activeRound: variantState.activeRound,
+            activeWildDefinition: { ...variantState.activeWildDefinition },
+            anteAmount: variantState.anteAmount,
+            hiddenDecisionState: {
+              currentRound: variantState.hiddenDecisionState.currentRound,
+              historyByPlayerId: Object.fromEntries(
+                Object.entries(
+                  variantState.hiddenDecisionState.historyByPlayerId
+                ).map(([id, history]) => [id, { ...history }])
+              ),
+              revealedByPlayerId: {
+                ...variantState.hiddenDecisionState.revealedByPlayerId,
+              },
+            },
+            lastPhaseSequence: [...variantState.lastPhaseSequence],
+            lastResolution: variantState.lastResolution
+              ? {
+                  ...variantState.lastResolution,
+                  legDeltaByPlayerId: {
+                    ...variantState.lastResolution.legDeltaByPlayerId,
+                  },
+                  payoutByPlayerId: {
+                    ...variantState.lastResolution.payoutByPlayerId,
+                  },
+                  revealedDecisions: {
+                    ...variantState.lastResolution.revealedDecisions,
+                  },
+                  showdownDescriptions: {
+                    ...variantState.lastResolution.showdownDescriptions,
+                  },
+                }
+              : null,
+            legsByPlayerId: { ...variantState.legsByPlayerId },
+            mode: variantState.mode,
+            penaltyModel: { ...variantState.penaltyModel },
+            pot: variantState.pot,
+            revealState: variantState.revealState,
+            showdownPlayerIds: [...variantState.showdownPlayerIds],
+          }
+        : null,
     };
   }
 
@@ -1694,6 +2581,10 @@ class PokerRealtimeService {
       status: room.status,
       tableInvites: cloneValue(room.tableInvites || []),
       tableName: room.tableName,
+      variantStateSnapshot:
+        room.gameSettings?.game === "357"
+          ? cloneValue(ensureThreeFiveSevenState(room))
+          : null,
     };
 
     const table = await GameTable.findByIdAndUpdate(tableId, update, {

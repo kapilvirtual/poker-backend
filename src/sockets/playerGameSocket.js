@@ -21,6 +21,15 @@ function initPlayerGameSocket(io) {
   }
 
   io.on("connection", (socket) => {
+    socket.on("network:ping", (payload = {}, ack) => {
+      if (typeof ack === "function") {
+        ack({
+          sentAt: payload.sentAt || null,
+          serverTime: Date.now(),
+        });
+      }
+    });
+
     socket.on("table:create", (payload = {}) => {
       withSocketErrorBoundary(socket, () => realtimeService.createRoom(socket, payload));
     });
